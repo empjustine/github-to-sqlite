@@ -1,4 +1,6 @@
 import base64
+import json
+
 import requests
 import re
 import time
@@ -114,7 +116,7 @@ def save_issues(db, issues, repo):
                 "https://api.github.com/repos/"
             )[1]
         # Extract user
-        issue["user"] = save_user(db, issue["user"])
+        issue["user"] = save_user(db, issue.get("user"))
         labels = issue.pop("labels")
         # Extract milestone
         if issue["milestone"]:
@@ -122,8 +124,7 @@ def save_issues(db, issues, repo):
         # For the moment we ignore the assignees=[] array but we DO turn assignee
         # singular into a foreign key reference
         issue.pop("assignees", None)
-        if issue["assignee"]:
-            issue["assignee"] = save_user(db, issue["assignee"])
+        issue["assignee"] = save_user(db, issue.get("assignee"))
         # Add a type field to distinguish issues from pulls
         issue["type"] = "pull" if issue.get("pull_request") else "issue"
         # Insert record
@@ -173,11 +174,10 @@ def save_pull_requests(db, pull_requests, repo):
         pull_request["url"] = pull_request["_links"]["html"]["href"]
         pull_request.pop("_links")
         # Extract user
-        pull_request["user"] = save_user(db, pull_request["user"])
+        pull_request["user"] = save_user(db, pull_request.get("user"))
         labels = pull_request.pop("labels")
         # Extract merged_by, if it exists
-        if pull_request.get("merged_by"):
-            pull_request["merged_by"] = save_user(db, pull_request["merged_by"])
+        pull_request["merged_by"] = save_user(db, pull_request.get("merged_by"))
         # Head sha
         pull_request["head"] = pull_request["head"]["sha"]
         pull_request["base"] = pull_request["base"]["sha"]
@@ -189,8 +189,7 @@ def save_pull_requests(db, pull_requests, repo):
         # For the moment we ignore the assignees=[] array but we DO turn assignee
         # singular into a foreign key reference
         pull_request.pop("assignees", None)
-        if original["assignee"]:
-            pull_request["assignee"] = save_user(db, pull_request["assignee"])
+        pull_request["assignee"] = save_user(db, pull_request.get("assignee"))
         pull_request.pop("active_lock_reason")
         # ignore requested_reviewers and requested_teams
         pull_request.pop("requested_reviewers", None)
@@ -223,12 +222,14 @@ def save_pull_requests(db, pull_requests, repo):
             table.m2m("labels", label, pk="id")
 
 
+known_users = {}
+
+
 def save_user(db, user):
-    # Under some conditions, GitHub caches removed repositories with  
+    # Under some conditions, GitHub caches removed repositories with
     # stars and ends up leaving dangling `None` user references.
     if user is None:
         return None
-    
     # Remove all url fields except avatar_url and html_url
     to_save = {
         key: value
@@ -239,12 +240,15 @@ def save_user(db, user):
     # so fill in 'name' from 'login' so Datasette foreign keys display
     if to_save.get("name") is None:
         to_save["name"] = to_save["login"]
-    return db["users"].upsert(to_save, pk="id", alter=True).last_pk
+    k = json.dumps(user, ensure_ascii=False, sort_keys=True)
+    if k not in known_users:
+        known_users[k] = db["users"].upsert(to_save, pk="id", alter=True).last_pk
+    return known_users[k]
 
 
 def save_milestone(db, milestone, repo_id):
     milestone = dict(milestone)
-    milestone["creator"] = save_user(db, milestone["creator"])
+    milestone["creator"] = save_user(db, milestone.get("creator"))
     milestone["repo"] = repo_id
     milestone.pop("labels_url", None)
     milestone.pop("url", None)
@@ -264,7 +268,7 @@ def save_milestone(db, milestone, repo_id):
 
 def save_issue_comment(db, comment):
     comment = dict(comment)
-    comment["user"] = save_user(db, comment["user"])
+    comment["user"] = save_user(db, comment.get("user"))
     # We set up a 'issue' foreign key, but only if issue is in the DB
     comment["issue"] = None
     issue_url = comment["issue_url"]
@@ -311,12 +315,9 @@ def save_repo(db, repo):
         for key, value in repo.items()
         if (key == "html_url") or not key.endswith("url")
     }
-    to_save["owner"] = save_user(db, to_save["owner"])
-    to_save["license"] = save_license(db, to_save["license"])
-    if "organization" in to_save:
-        to_save["organization"] = save_user(db, to_save["organization"])
-    else:
-        to_save["organization"] = None
+    to_save["owner"] = save_user(db, to_save.get("owner"))
+    to_save["license"] = save_license(db, to_save.get("license"))
+    to_save["organization"] = save_user(db, to_save.get("organization"))
     repo_id = (
         db["repos"]
         .insert(
@@ -337,10 +338,16 @@ def save_repo(db, repo):
     return repo_id
 
 
+known_licenses = {"null": None}
+
+
 def save_license(db, license):
-    if license is None:
-        return None
-    return db["licenses"].insert(license, pk="key", replace=True).last_pk
+    k = json.dumps(license, ensure_ascii=False, sort_keys=True)
+    if k not in known_licenses:
+        known_licenses[k] = (
+            db["licenses"].insert(license, pk="key", replace=True).last_pk
+        )
+    return known_licenses[k]
 
 
 def fetch_issues(repo, token=None, issue_ids=None):
@@ -411,7 +418,8 @@ def fetch_tags(repo, token=None):
 
 def fetch_commits(repo, token=None, stop_when=None):
     if stop_when is None:
-        stop_when = lambda commit: False
+        def stop_when(commit):
+            return False
     headers = make_headers(token)
     url = "https://api.github.com/repos/{}/commits".format(repo)
     try:
@@ -509,7 +517,7 @@ def save_stars(db, user, stars):
 def save_stargazers(db, repo_id, stargazers):
     for stargazer in stargazers:
         starred_at = stargazer["starred_at"]
-        user_id = save_user(db, stargazer["user"])
+        user_id = save_user(db, stargazer.get("user"))
         db["stars"].upsert(
             {"user": user_id, "repo": repo_id, "starred_at": starred_at},
             pk=("user", "repo"),
@@ -530,7 +538,7 @@ def save_releases(db, releases, repo_id=None):
         }
         assets = release.pop("assets") or []
         release["repo"] = repo_id
-        release["author"] = save_user(db, release["author"])
+        release["author"] = save_user(db, release.get("author"))
         release_id = (
             db["releases"]
             .insert(
@@ -540,7 +548,7 @@ def save_releases(db, releases, repo_id=None):
         )
         # Handle assets
         for asset in assets:
-            asset["uploader"] = save_user(db, asset["uploader"])
+            asset["uploader"] = save_user(db, asset.get("uploader"))
             asset["release"] = release_id
 
         db["assets"].upsert_all(
@@ -643,12 +651,8 @@ def save_commits(db, commits, repo_id=None):
             "raw_committer": save_commit_author(db, commit["commit"]["committer"]),
         }
         commit_to_insert["repo"] = repo_id
-        commit_to_insert["author"] = (
-            save_user(db, commit["author"]) if commit["author"] else None
-        )
-        commit_to_insert["committer"] = (
-            save_user(db, commit["committer"]) if commit["committer"] else None
-        )
+        commit_to_insert["author"] = save_user(db, commit.get("author"))
+        commit_to_insert["committer"] = save_user(db, commit.get("committer"))
         db["commits"].insert(
             commit_to_insert,
             alter=True,
@@ -704,7 +708,6 @@ def ensure_db_shape(db):
         db[table].enable_fts(columns, create_triggers=True)
 
     # Views:
-    existing_views = set(db.view_names())
     existing_tables = set(db.table_names())
     for view, (tables, sql) in VIEWS.items():
         # Do all of the tables exist?

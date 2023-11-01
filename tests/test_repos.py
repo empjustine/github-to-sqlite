@@ -2,7 +2,6 @@ import base64
 import pytest
 import pathlib
 import sqlite_utils
-from sqlite_utils.db import ForeignKey
 import json
 from click.testing import CliRunner
 from github_to_sqlite import cli
